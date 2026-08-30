@@ -88,7 +88,11 @@ R 4.5.2 (2025-10-31 ucrt) on Windows 11 (64-bit). Principal packages:
 Full session details are in `session_info.txt`.
 
 The correlation analysis (`R/correlation_analysis.R`) requires only base R and runs on R ≥ 4.0.
-
+## Broad Null Size Validation (Revised Manuscript, Section 2.9)
+`R/size_validation.R` reproduces the 48-condition broad null validation
+reported in Table 10 of the revised manuscript.
+Runtime: ~30–60 min (single core). R >= 4.0, base packages only.
+Output file: `data/phi_max_size_table_v2.csv`
 ## Citation
 
 If you use this dataset or analysis in your work, please cite the manuscript above.
