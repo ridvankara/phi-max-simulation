@@ -1,1 +1,214 @@
+# =============================================================================
+# PHI-max: Broad Null Size Validation — v2
+# Fixes: (1) NaN/Inf from extreme p-values, (2) na.rm in quantile
+# New:   (3) k=10 limitation flagged as scientific finding
+# =============================================================================
 
+set.seed(2026)
+
+# =============================================================================
+# 1. COMPONENT FUNCTIONS — with numerical safety floors
+# =============================================================================
+
+# Safe p-value floor/ceiling to prevent qnorm(0) = -Inf etc.
+safe_p <- function(p) pmax(pmin(p, 1 - 1e-15), 1e-15)
+
+pcurve_score <- function(p) {
+  sig <- p[p < 0.05]
+  if (length(sig) < 2) return(0)
+  pp_left <- safe_p(sig / 0.05)
+  z_left  <- sum(qnorm(pp_left)) / sqrt(length(sig))
+  if (!is.finite(z_left)) return(0)
+  return(z_left)
+}
+
+tiva_score <- function(p) {
+  k <- length(p)
+  if (k < 2) return(0)
+  p    <- safe_p(p)
+  z    <- qnorm(1 - p)
+  # Hard-cap any remaining non-finite z (qnorm precision limit ~38)
+  z[!is.finite(z)] <- sign(z[!is.finite(z)]) * 38
+  chi2 <- (k - 1) * var(z)
+  if (!is.finite(chi2) || chi2 < 0) return(0)
+  p_tiva <- pchisq(chi2, df = k - 1, lower.tail = TRUE)
+  p_tiva <- max(p_tiva, 1e-10)
+  return(-log10(p_tiva))
+}
+
+caliper_score <- function(p) {
+  lower <- sum(p >= 0.040 & p < 0.045)
+  upper <- sum(p >= 0.045 & p < 0.050)
+  n_cal <- lower + upper
+  if (n_cal == 0) return(0)
+  p_cal <- binom.test(upper, n_cal, p = 0.5,
+                      alternative = "greater")$p.value
+  p_cal <- max(p_cal, 1e-10)
+  return(-log10(p_cal))
+}
+
+# =============================================================================
+# 2. DATA GENERATION
+# =============================================================================
+
+generate_pvalues <- function(k, n, delta_mean = 0, tau = 0) {
+  deltas <- if (tau > 0) rnorm(k, mean = delta_mean, sd = tau)
+            else         rep(delta_mean, k)
+  x1 <- matrix(rnorm(k * n, 0,      1), nrow = n, ncol = k)
+  x2 <- matrix(rnorm(k * n, 0,      1), nrow = n, ncol = k) +
+        matrix(rep(deltas, each = n),   nrow = n, ncol = k)
+  z  <- (colMeans(x2) - colMeans(x1)) / sqrt(2 / n)
+  p  <- 2 * (1 - pnorm(abs(z)))
+  return(p)
+}
+
+study_raw_scores <- function(k, n, delta_mean = 0, tau = 0) {
+  p <- generate_pvalues(k, n, delta_mean, tau)
+  c(pcurve  = pcurve_score(p),
+    tiva    = tiva_score(p),
+    caliper = caliper_score(p))
+}
+
+# =============================================================================
+# 3. MID-RANK ECDF CALIBRATION
+# =============================================================================
+
+midrank_ecdf <- function(x, ref) {
+  (mean(ref < x) + mean(ref <= x)) / 2
+}
+
+build_calibration <- function(k, n, N_cal = 100000) {
+  cat(sprintf("  Calibrating k=%d, n=%d...", k, n))
+  scores <- t(replicate(N_cal,
+                        study_raw_scores(k, n, delta_mean = 0, tau = 0)))
+  cat(" done.\n")
+  list(pcurve  = scores[, "pcurve"],
+       tiva    = scores[, "tiva"],
+       caliper = scores[, "caliper"])
+}
+
+standardise_scores <- function(raw, cal) {
+  c(pcurve_mr  = midrank_ecdf(raw["pcurve"],  cal$pcurve),
+    tiva_mr    = midrank_ecdf(raw["tiva"],     cal$tiva),
+    caliper_mr = midrank_ecdf(raw["caliper"],  cal$caliper))
+}
+
+# =============================================================================
+# 4. SIMULATION GRID
+# =============================================================================
+
+k_vals   <- c(10, 20, 50, 100)
+n_vals   <- c(15, 30, 60)
+tau_vals <- c(0, 0.1, 0.2, 0.3)
+
+N_cal <- 100000
+N_val <- 10000
+
+# Table 9 thresholds
+thresholds <- c(Low = 0.802, Medium = 0.928, High = 0.972, Critical = 0.997)
+
+bonferroni_fpr <- function(t) 3 * (1 - t)
+
+# =============================================================================
+# 5. MAIN LOOP
+# =============================================================================
+
+cat("=== PHI-max Broad Null Size Validation v2 ===\n\n")
+
+results  <- list()
+row_idx  <- 1
+
+for (k in k_vals) {
+  cat(sprintf("\n[k = %d]\n", k))
+  for (n in n_vals) {
+    cal <- build_calibration(k, n, N_cal)
+
+    for (tau in tau_vals) {
+      cat(sprintf("    tau=%.1f ...", tau))
+
+      # Generate validation scores, skip NA rows
+      phi_max_scores <- numeric(N_val)
+      na_count       <- 0L
+      for (i in seq_len(N_val)) {
+        raw <- tryCatch(
+          study_raw_scores(k, n, delta_mean = 0, tau = tau),
+          error = function(e) rep(NA_real_, 3)
+        )
+        if (any(is.na(raw))) { na_count <- na_count + 1L; next }
+        std <- standardise_scores(raw, cal)
+        phi_max_scores[i] <- max(std, na.rm = TRUE)
+      }
+
+      # Remove NA placeholders (from skipped rows)
+      valid_scores <- phi_max_scores[phi_max_scores != 0 | seq_along(phi_max_scores) == 1]
+      # Actually just use all non-NA
+      phi_max_scores[phi_max_scores == 0 & seq_along(phi_max_scores) > 1] <- NA
+      valid_scores <- phi_max_scores[!is.na(phi_max_scores)]
+
+      if (length(valid_scores) < 100) {
+        cat(sprintf(" SKIP (too many NAs: %d)\n", na_count))
+        next
+      }
+
+      fprs     <- sapply(thresholds, function(t) mean(valid_scores > t, na.rm = TRUE))
+      bf_bounds <- sapply(thresholds, bonferroni_fpr)
+
+      cat(sprintf(" FPR@High=%.3f  (n_valid=%d, n_NA=%d)\n",
+                  fprs["High"], length(valid_scores), na_count))
+
+      size_ok <- fprs["High"] <= 0.05
+
+      results[[row_idx]] <- data.frame(
+        k            = k,
+        n            = n,
+        tau          = tau,
+        null_type    = ifelse(tau == 0, "Pure null (homogeneous)",
+                       ifelse(tau <= 0.1, "Heterogeneous (small RE)",
+                       ifelse(tau <= 0.2, "Heterogeneous (medium RE)",
+                                          "Heterogeneous (large RE)"))),
+        n_valid      = length(valid_scores),
+        n_NA         = na_count,
+        mean_phi     = round(mean(valid_scores), 3),
+        q95_phi      = round(quantile(valid_scores, 0.95, na.rm = TRUE), 3),
+        FPR_Low      = round(fprs["Low"],      3),
+        FPR_Medium   = round(fprs["Medium"],   3),
+        FPR_High     = round(fprs["High"],     3),
+        FPR_Critical = round(fprs["Critical"], 3),
+        BF_High      = round(bf_bounds["High"], 3),
+        size_ok_High = size_ok,
+        stringsAsFactors = FALSE
+      )
+      row_idx <- row_idx + 1
+    }
+  }
+}
+
+results_df <- do.call(rbind, results)
+
+# =============================================================================
+# 6. OUTPUT
+# =============================================================================
+
+write.csv(results_df, "phi_max_size_table_v2.csv", row.names = FALSE)
+
+cat("\n\n=== SUMMARY ===\n")
+alpha <- 0.05
+for (thr_name in names(thresholds)) {
+  col  <- paste0("FPR_", thr_name)
+  viol <- sum(results_df[[col]] > alpha, na.rm = TRUE)
+  tot  <- sum(!is.na(results_df[[col]]))
+  cat(sprintf("  %-8s threshold: %d / %d cells exceed FPR=0.05\n",
+              thr_name, viol, tot))
+}
+
+cat("\n  k=10 cells only:\n")
+sub10 <- results_df[results_df$k == 10, ]
+cat(sprintf("    High threshold FPR: range [%.3f, %.3f], mean %.3f\n",
+            min(sub10$FPR_High), max(sub10$FPR_High), mean(sub10$FPR_High)))
+
+cat("\n  k >= 20 cells only:\n")
+sub20 <- results_df[results_df$k >= 20, ]
+cat(sprintf("    High threshold FPR: range [%.3f, %.3f], mean %.3f\n",
+            min(sub20$FPR_High), max(sub20$FPR_High), mean(sub20$FPR_High)))
+
+cat("\nDone. Output: phi_max_size_table_v2.csv\n")
